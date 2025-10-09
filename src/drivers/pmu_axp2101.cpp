@@ -1,55 +1,61 @@
-#include "pmu_axp2101.hpp"
+#include "drivers/pmu_axp2101.hpp"
+#include "drivers/board_pins.hpp"
+#include "os/bus_guard.hpp"
+#include <Wire.h>
 
-// kleine Helfer
+PMU_AXP2101 PMU;
+
 static inline uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
 }
 
-// globale Instanz
-PMU_AXP2101 PMU;
+bool PMU_AXP2101::beginDefault() {
+  Wire.begin(TWATCH_S3_I2C0::SDA, TWATCH_S3_I2C0::SCL, TWATCH_S3_I2C0::FREQ_HZ);
+  return begin(Wire, 0x34, TWATCH_S3_PMU_Pins::PMU_IRQ);
+}
 
 bool PMU_AXP2101::begin(TwoWire& bus, uint8_t addr, int irq_gpio) {
   if (_ok) return true;
+
+  _bus = &bus;
 
   // WICHTIG: Wire ist bereits initialisiert → (-1,-1), damit XPowers kein begin() triggert
   _ok = _pmu.begin(bus, addr, -1, -1);
   if (!_ok) return false;
 
-  // IRQ-Masken setzen (erst alles aus, dann gewünschte an)
-  // XPowers erwartet eine Maske → 0=keine/aus, ~0ULL=alle Bits
+  // IRQ-Maske + Clear
+  if (!g_bus.lockI2C0(pdMS_TO_TICKS(10))) return false;
   _pmu.disableIRQ(~0ULL);
-  initIrqMask_();
   _pmu.clearIrqStatus();
+  g_bus.unlockI2C0();
 
-  // GPIO-IRQ
+  initIrqMask_();
+
   _irq_gpio = irq_gpio;
   if (_irq_gpio >= 0) {
-    pinMode(_irq_gpio, INPUT_PULLUP);               // AXP INT: open-drain, active-low
+    pinMode(_irq_gpio, INPUT_PULLUP);
     attachInterruptArg((gpio_num_t)_irq_gpio, _onIsr_, this, FALLING);
   }
 
-  // Event-Task starten
   xTaskCreatePinnedToCore(_evtTaskTrampoline_, "pmu_evt", 3072, this, 3, &_evtTask, 0);
+  _btn_down = false;
   return true;
 }
 
 void PMU_AXP2101::end() {
   if (!_ok) return;
 
-  if (_irq_gpio >= 0) {
-    detachInterrupt((gpio_num_t)_irq_gpio);
-  }
+  if (_irq_gpio >= 0) detachInterrupt((gpio_num_t)_irq_gpio);
+
+  if (!g_bus.lockI2C0(pdMS_TO_TICKS(10))) return;
   _pmu.disableIRQ(~0ULL);
+  g_bus.unlockI2C0();
 
-  if (_evtTask) {
-    TaskHandle_t t = _evtTask;
-    _evtTask = nullptr;
-    vTaskDelete(t);
-  }
+  if (_evtTask) { TaskHandle_t t = _evtTask; _evtTask = nullptr; vTaskDelete(t); }
 
-  // _pmu.end() ist protected → nicht aufrufbar; Instanz lebt statisch weiter.
+  _btn_down = false;
   _ok = false;
 }
 
@@ -83,22 +89,29 @@ void PMU_AXP2101::_evtTask_() {
 }
 
 bool PMU_AXP2101::_drainIrqStatus_() {
+  if (!g_bus.lockI2C0(pdMS_TO_TICKS(5))) return false;
   uint64_t st = _pmu.getIrqStatus();
-  if (!st) return false;
   _pmu.clearIrqStatus();
+  g_bus.unlockI2C0();
 
-  if (st & XPOWERS_AXP2101_PKEY_POSITIVE_IRQ) _pushEvt_(EventType::BUTTON_PRESS);
-  if (st & XPOWERS_AXP2101_PKEY_NEGATIVE_IRQ) _pushEvt_(EventType::BUTTON_RELEASE);
+  if (!st) return false;
+
+  const bool bit_press   = (st & XPOWERS_AXP2101_PKEY_POSITIVE_IRQ) != 0;
+  const bool bit_release = (st & XPOWERS_AXP2101_PKEY_NEGATIVE_IRQ) != 0;
+  const bool bit_short   = (st & XPOWERS_AXP2101_PKEY_SHORT_IRQ)    != 0;
+  const bool bit_long    = (st & XPOWERS_AXP2101_PKEY_LONG_IRQ)     != 0;
+
+  if (bit_press && !_btn_down) { _pushEvt_(EventType::BUTTON_PRESS); _btn_down = true; }
+  if (bit_short) _pushEvt_(EventType::BUTTON_SHORT);
+  if (bit_long)  _pushEvt_(EventType::BUTTON_LONG);
+  if (bit_release) {
+    if (_btn_down) { _pushEvt_(EventType::BUTTON_RELEASE); _btn_down = false; }
+  }
 
   if (st & XPOWERS_AXP2101_BAT_CHG_START_IRQ) _pushEvt_(EventType::CHG_START);
   if (st & XPOWERS_AXP2101_BAT_CHG_DONE_IRQ)  _pushEvt_(EventType::CHG_DONE);
-
   if (st & XPOWERS_AXP2101_VBUS_INSERT_IRQ)   _pushEvt_(EventType::VBUS_IN);
   if (st & XPOWERS_AXP2101_VBUS_REMOVE_IRQ)   _pushEvt_(EventType::VBUS_OUT);
-
-  // Optional: HW Short/Long nur nutzen, wenn später gewünscht
-  if (st & XPOWERS_AXP2101_PKEY_SHORT_IRQ)    _pushEvt_(EventType::BUTTON_SHORT);
-  if (st & XPOWERS_AXP2101_PKEY_LONG_IRQ)     _pushEvt_(EventType::BUTTON_LONG);
 
   return true;
 }
@@ -111,8 +124,12 @@ bool PMU_AXP2101::initIrqMask_() {
   mask |= (uint64_t)XPOWERS_AXP2101_VBUS_REMOVE_IRQ;
   mask |= (uint64_t)XPOWERS_AXP2101_BAT_CHG_START_IRQ;
   mask |= (uint64_t)XPOWERS_AXP2101_BAT_CHG_DONE_IRQ;
+  mask |= (uint64_t)XPOWERS_AXP2101_PKEY_SHORT_IRQ;
+  mask |= (uint64_t)XPOWERS_AXP2101_PKEY_LONG_IRQ;
 
+  if (!g_bus.lockI2C0(pdMS_TO_TICKS(5))) return false;
   _pmu.enableIRQ(mask);
+  g_bus.unlockI2C0();
   return true;
 }
 
@@ -124,38 +141,40 @@ bool PMU_AXP2101::popEvent(Event &out) {
   return true;
 }
 
-// ---- Telemetrie -------------------------------------------------------------
-
 PMU_AXP2101::Telemetry PMU_AXP2101::readTelemetry() {
   Telemetry t;
   if (!_ok) return t;
+  if (!g_bus.lockI2C0(pdMS_TO_TICKS(5))) return t;
 
-  // Beachte: XPowers 0.2.9 liefert diese Methoden (nicht const):
   t.batt_mV      = _pmu.getBattVoltage();
-  t.sys_mV       = _pmu.getSystemVoltage(); // NICHT getSysPowerVoltage()
+  t.sys_mV       = _pmu.getSystemVoltage();
   t.vbus_mV      = _pmu.getVbusVoltage();
   t.batt_percent = _pmu.getBatteryPercent();
   t.charging     = _pmu.isCharging();
+
+  g_bus.unlockI2C0();
   return t;
 }
-
-// ---- Policies / Limits ------------------------------------------------------
 
 bool PMU_AXP2101::setChargeTargetMillivolts(int mV) {
   if (mV < 4100) mV = 4100;
   if (mV > 4600) mV = 4600;
-  return _pmu.setChargeTargetVoltage(mV);
+  if (!g_bus.lockI2C0(pdMS_TO_TICKS(5))) return false;
+  bool ok = _pmu.setChargeTargetVoltage(mV);
+  g_bus.unlockI2C0();
+  return ok;
 }
 
 bool PMU_AXP2101::setVbusLimitMilliamp(int mA) {
   if (mA < 100) mA = 100;
   if (mA > 5000) mA = 5000;
-  return _pmu.setVbusCurrentLimit(mA);
+  if (!g_bus.lockI2C0(pdMS_TO_TICKS(5))) return false;
+  bool ok = _pmu.setVbusCurrentLimit(mA);
+  g_bus.unlockI2C0();
+  return ok;
 }
 
 void PMU_AXP2101::enableCharging(bool en) {
-  // Kompatibilität: in dieser Lib-Version verwenden wir keinen direkten Call.
-  // Wenn später benötigt: _pmu.setChargingEnable(en); (abhängig von XPowers-Version)
   (void)en;
 }
 
@@ -163,10 +182,27 @@ void PMU_AXP2101::enableCharging(bool en) {
 
 bool PMU_AXP2101::setBacklightRail(uint16_t millivolt, bool on) {
   if (!_ok) return false;
-  const uint16_t mv = clamp_u16(millivolt, kBL_Min_mV, kBL_Max_mV);
-  _pmu.setALDO2Voltage(mv);
-  if (on) _pmu.enableALDO2();
-  else    _pmu.disableALDO2();
+
+  const uint16_t target = clamp_u16(millivolt, kBL_Min_mV, kBL_Max_mV);
+
+  if (!g_bus.lockI2C0(pdMS_TO_TICKS(10))) return false;
+
+  if (on) {
+    uint16_t pre = (uint16_t)((target * 10U) / 100U);
+    if (pre < kBL_Min_mV) pre = kBL_Min_mV;
+    if (pre > target)     pre = target;
+
+    _pmu.setALDO2Voltage(pre);
+    _pmu.enableALDO2();
+    g_bus.unlockI2C0();
+    vTaskDelay(pdMS_TO_TICKS(3));
+    if (!g_bus.lockI2C0(pdMS_TO_TICKS(10))) return false;
+    _pmu.setALDO2Voltage(target);
+  } else {
+    _pmu.disableALDO2();
+  }
+
+  g_bus.unlockI2C0();
   return true;
 }
 
@@ -175,6 +211,8 @@ bool PMU_AXP2101::setLoRaRails(bool on, uint16_t aldo4_mV, uint16_t dldo2_mV) {
 
   aldo4_mV = clamp_u16(aldo4_mV, kLORA_Min_mV, kLORA_Max_mV);
   dldo2_mV = clamp_u16(dldo2_mV, kLORA_Min_mV, kLORA_Max_mV);
+
+  if (!g_bus.lockI2C0(pdMS_TO_TICKS(10))) return false;
 
   _pmu.setALDO4Voltage(aldo4_mV);
   _pmu.setDLDO2Voltage(dldo2_mV);
@@ -186,19 +224,7 @@ bool PMU_AXP2101::setLoRaRails(bool on, uint16_t aldo4_mV, uint16_t dldo2_mV) {
     _pmu.disableDLDO2();
     _pmu.disableALDO4();
   }
-  return true;
-}
 
-const char* PMU_AXP2101::evtName(EventType t) {
-  switch (t) {
-    case EventType::BUTTON_PRESS:   return "BUTTON_PRESS";
-    case EventType::BUTTON_RELEASE: return "BUTTON_RELEASE";
-    case EventType::BUTTON_SHORT:   return "BUTTON_SHORT";
-    case EventType::BUTTON_LONG:    return "BUTTON_LONG";
-    case EventType::CHG_START:      return "CHG_START";
-    case EventType::CHG_DONE:       return "CHG_DONE";
-    case EventType::VBUS_IN:        return "VBUS_IN";
-    case EventType::VBUS_OUT:       return "VBUS_OUT";
-    default:                        return "NONE";
-  }
+  g_bus.unlockI2C0();
+  return true;
 }

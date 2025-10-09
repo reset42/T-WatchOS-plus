@@ -13,6 +13,7 @@
 #include <Wire.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <XPowersLib.h>
 
 class PMU_AXP2101 {
@@ -40,7 +41,8 @@ public:
   // ---- Lifecycle ------------------------------------------------------------
   // Achtung: Wire muss vorher mit SDA/SCL initialisiert sein (Wire.begin(...))
   bool begin(TwoWire& bus, uint8_t addr = 0x34, int irq_gpio = -1);
-  void end(); // detach ISR, IRQs aus, Task killen (kein _pmu.end(), das ist protected)
+  bool beginDefault(); // I2C0 laut board_pins
+  void end();          // detach ISR, IRQs aus, Task killen (kein _pmu.end(), das ist protected)
 
   // ---- IRQ/Event plumbing ---------------------------------------------------
   void setEventCallback(EventCallback cb) { _cb = cb; }
@@ -65,7 +67,7 @@ public:
   // Backlight: ALDO2
   static constexpr uint16_t kBL_Min_mV = 1800;
   static constexpr uint16_t kBL_Max_mV = 3300;
-  bool setBacklightRail(uint16_t millivolt, bool on);
+  bool setBacklightRail(uint16_t millivolt, bool on); // jetzt mit sanfter 2-Step-Rampe
 
   // LoRa: ALDO4 + DLDO2
   static constexpr uint16_t kLORA_Min_mV = 1800;
@@ -85,7 +87,7 @@ private:
   static void _evtTaskTrampoline_(void* arg);
   void  _evtTask_();
 
-  // IRQ-Status auslesen/decodieren
+  // IRQ-Status auslesen/decodieren (mit Button-Sequencing)
   bool  _drainIrqStatus_();
 
   // Ringbuffer
@@ -98,18 +100,29 @@ private:
     const uint8_t h = _qh;
     const uint8_t n = (uint8_t)((h + 1U) % QSIZE);
     if (n == _qt) _qt = (uint8_t)((_qt + 1U) % QSIZE); // drop oldest
-    _q[h].type = t;
+    _q[h].type  = t;
     _q[h].ts_ms = (uint32_t)millis();
     _qh = n;
   }
+
+  // I2C-Guard (MVP): Mutex für Wire (I2C0)
+  bool lockI2C_(TickType_t to_ticks);
+  void unlockI2C_();
 
 private:
   XPowersAXP2101 _pmu;
   bool           _ok{false};
 
+  TwoWire*       _bus{nullptr};
   int            _irq_gpio{-1};
   TaskHandle_t   _evtTask{nullptr};
   EventCallback  _cb{nullptr};
+
+  // interner Button-State (Sequencing)
+  bool           _btn_down{false};
+
+  // geteilter Mutex für I2C0
+  static SemaphoreHandle_t s_i2c0_mtx;
 };
 
 // bequeme globale Instanz

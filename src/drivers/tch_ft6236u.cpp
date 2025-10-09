@@ -1,87 +1,74 @@
 #include "drivers/tch_ft6236u.hpp"
+#include "os/bus_guard.hpp"
+#include <freertos/FreeRTOS.h>
+#include <Wire.h>
 
 bool TCH_FT6236U::begin(TwoWire& bus, uint8_t addr7bit, int irq_gpio) {
-  _bus  = &bus;
-  _addr = addr7bit;
-  _irq  = irq_gpio;
+  _bus     = &bus;
+  _addr    = addr7bit;
+  _irq     = irq_gpio;
+  _ok      = false;
   _pending = false;
-  _ok = false;
 
   if (_irq >= 0) {
-    pinMode(_irq, INPUT_PULLUP);
+    pinMode((gpio_num_t)_irq, INPUT_PULLUP);
+    attachInterruptArg((gpio_num_t)_irq, _isrThunk, this, FALLING);
   }
 
-  // --- Erst I2C-Probe, dann IRQ anhängen ---
-  uint8_t tmp = 0;
-  if (!_readBytes(0x00, &tmp, 1)) return false; // DEV_MODE
-  if (!_readBytes(0x02, &tmp, 1)) return false; // TD_STATUS
+  // einfacher Ping (Chip ID)
+  if (!g_bus.lockI2C1(pdMS_TO_TICKS(5))) return false;
+  _bus->beginTransmission(_addr);
+  _bus->write(0xA8);                 // ID-Reg
+  _bus->endTransmission(false);
+  _bus->requestFrom((int)_addr, 1);
+  uint8_t id = _bus->available() ? _bus->read() : 0x00;
+  g_bus.unlockI2C1();
 
-  if (_irq >= 0) {
-    // attach mit Arg; ISR macht nur Flag
-    attachInterruptArg((uint8_t)_irq, &_isrThunk, this, FALLING);
-  }
-
-  _ok = true;
-  return true;
+  _ok = (id != 0x00 && id != 0xFF);
+  return _ok;
 }
 
 void TCH_FT6236U::end() {
-  if (_irq >= 0) {
-    detachInterrupt((uint8_t)_irq);
-  }
-  _bus = nullptr;
+  if (_irq >= 0) detachInterrupt((gpio_num_t)_irq);
   _ok = false;
   _pending = false;
-}
-
-void IRAM_ATTR TCH_FT6236U::_isrThunk(void* arg) {
-  TCH_FT6236U* self = reinterpret_cast<TCH_FT6236U*>(arg);
-  if (self) self->_pending = true; // nur Flag, kein I2C im ISR!
-}
-
-bool TCH_FT6236U::_readBytes(uint8_t reg, uint8_t* buf, size_t len) {
-  if (!_bus) return false;
-
-  _bus->beginTransmission(_addr);
-  _bus->write(reg);
-  if (_bus->endTransmission(false) != 0) return false; // repeated start
-
-  size_t n = _bus->requestFrom((int)_addr, (int)len);
-  if (n != len) return false;
-
-  for (size_t i = 0; i < len; ++i) {
-    if (!_bus->available()) return false;
-    buf[i] = _bus->read();
-  }
-  return true;
 }
 
 bool TCH_FT6236U::readReport(Report& out) {
   out.count = 0;
-  out.pts[0] = {0,0,0,0};
-  out.pts[1] = {0,0,1,0};
+  if (!_ok) { _pending = false; return false; }
 
-  if (!_ok || !_bus) return false;
+  if (!g_bus.lockI2C1(pdMS_TO_TICKS(5))) { _pending = false; return false; }
 
-  // 0x00..0x0C lesen (DEV_MODE..P2_YL)
-  uint8_t buf[0x0D] = {0};
-  if (!_readBytes(0x00, buf, sizeof(buf))) return false;
+  // FT6236U: Data ab 0x02 → 1 Finger: 6 Bytes (0x02..0x07)
+  _bus->beginTransmission(_addr);
+  _bus->write(0x02);
+  _bus->endTransmission(false);
 
-  uint8_t touches = buf[0x02] & 0x0F; // TD_STATUS
-  if (touches > 2) touches = 2;
+  const int N = 6;
+  int got = _bus->requestFrom((int)_addr, N);
+  if (got == N) {
+    uint8_t buf[N];
+    for (int i=0;i<N;i++) buf[i] = _bus->read();
+    uint8_t event = (buf[0] >> 6) & 0x03;
+    uint16_t x = ((uint16_t)(buf[0] & 0x0F) << 8) | (uint16_t)buf[1];
+    uint16_t y = ((uint16_t)(buf[2] & 0x0F) << 8) | (uint16_t)buf[3];
+    out.count        = 1;
+    out.pts[0].event = event; // 0=down, 1=up, 2/3=contact
+    out.pts[0].id    = 0;
+    out.pts[0].x     = x;
+    out.pts[0].y     = y;
+  } else {
+    out.count = 0;
+  }
 
-  auto parsePoint = [&](int base, Point& p){
-    uint8_t XH = buf[base+0], XL = buf[base+1];
-    uint8_t YH = buf[base+2], YL = buf[base+3];
-    p.event = (uint8_t)((XH >> 6) & 0x03);    // 0=down,1=up,2=contact
-    p.id    = (uint8_t)((YH >> 4) & 0x0F);
-    p.x     = (uint16_t)(((XH & 0x0F) << 8) | XL);
-    p.y     = (uint16_t)(((YH & 0x0F) << 8) | YL);
-  };
-
-  if (touches >= 1) { parsePoint(0x03, out.pts[0]); out.count = 1; }
-  if (touches >= 2) { parsePoint(0x09, out.pts[1]); out.count = 2; }
-
-  _pending = false; // Lesen quittiert INT (Level-IRQ)
+  g_bus.unlockI2C1();
+  _pending = false;
   return true;
+}
+
+void IRAM_ATTR TCH_FT6236U::_isrThunk(void* arg) {
+  auto self = reinterpret_cast<TCH_FT6236U*>(arg);
+  if (!self) return;
+  self->_pending = true;
 }
